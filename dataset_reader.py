@@ -1,102 +1,156 @@
 from __future__ import annotations
+
 import csv
 import logging
+from dataclasses import dataclass
 from pathlib import Path
- 
+
 import numpy as np
- 
+
 logger = logging.getLogger(__name__)
- 
-# Expected number of features in a KitNET feature CSV
+
 EXPECTED_N_FEATURES = 115
- 
- 
-class CSVDatasetReader:
- 
+
+_BENIGN_TOKENS = {
+    "0",
+    "0.0",
+    "benign",
+    "normal",
+    "false",
+    "no",
+    "clean",
+    "legit",
+}
+
+
+@dataclass(frozen=True)
+class DatasetPair:
+    name: str
+    features_path: Path
+    labels_path: Path
+
+
+def discover_dataset_pairs(sample_dir: str | Path) -> list[DatasetPair]:
+    sample_dir = Path(sample_dir)
+    if not sample_dir.exists():
+        raise FileNotFoundError(f"Directory not found: {sample_dir}")
+
+    pairs: list[DatasetPair] = []
+
+    for features_path in sorted(sample_dir.glob("*_dataset.csv")):
+        labels_path = features_path.with_name(
+            features_path.name.replace("_dataset.csv", "_labels.csv")
+        )
+
+        if not labels_path.exists():
+            logger.warning("Skipped %s because labels were missing.", features_path.name)
+            continue
+
+        name = features_path.stem.replace("_dataset", "")
+        pairs.append(
+            DatasetPair(
+                name=name,
+                features_path=features_path,
+                labels_path=labels_path,
+            )
+        )
+
+    return pairs
+
+
+class PairedCSVDatasetReader:
+    """Streams paired feature and label rows from two CSV files."""
+
     def __init__(
         self,
-        features_path:   str | Path,
-        timestamps_path: str | Path | None = None,
+        features_path: str | Path,
+        labels_path: str | Path,
+        expected_n_features: int = EXPECTED_N_FEATURES,
     ):
-        self.features_path   = Path(features_path)
-        self.timestamps_path = Path(timestamps_path) if timestamps_path else None
+        self.features_path = Path(features_path)
+        self.labels_path = Path(labels_path)
+        self.expected_n_features = expected_n_features
         self._n_features: int | None = None
- 
- 
-    def __iter__(self):
-        """
-        Yields (feature_vector, timestamp) for each row.
-        feature_vector : np.ndarray, shape (n_features,), dtype float32
-        timestamp      : float
-        """
-        ts_iter = self._open_timestamps()
- 
-        with open(self.features_path, newline="") as feat_fh:
-            reader = csv.reader(feat_fh)
-            for row_idx, row in enumerate(reader):
-                if not row:
-                    continue
- 
-                # Parse feature vector
-                try:
-                    feat = np.array(row, dtype=np.float32)
-                except ValueError:
-                    # Skip header rows or malformed lines
-                    logger.debug("Skipping non-numeric row %d", row_idx)
-                    continue
- 
-                # Validate dimensionality on first real row
-                if self._n_features is None:
-                    self._n_features = len(feat)
-                    if self._n_features != EXPECTED_N_FEATURES:
-                        logger.warning(
-                            "Feature CSV has %d columns; expected %d. "
-                            "Proceeding anyway.",
-                            self._n_features, EXPECTED_N_FEATURES,
-                        )
- 
-                feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
- 
-                # Get matching timestamp
-                timestamp = next(ts_iter, float(row_idx))
- 
-                yield feat, float(timestamp)
- 
-    def _open_timestamps(self):
 
-        if self.timestamps_path is None or not self.timestamps_path.exists():
-            # Synthetic timestamps: 0.0, 1.0, 2.0, ...
-            def _counter():
-                i = 0
-                while True:
-                    yield float(i)
-                    i += 1
-            return _counter()
- 
-        def _ts_gen():
-            with open(self.timestamps_path, newline="") as fh:
-                reader = csv.reader(fh)
-                for row in reader:
-                    if not row:
-                        continue
-                    try:
-                        yield float(row[0])
-                    except (ValueError, IndexError):
-                        yield 0.0
- 
-        return _ts_gen()
- 
- 
+        if not self.features_path.exists():
+            raise FileNotFoundError(f"Features file not found: {self.features_path}")
+        if not self.labels_path.exists():
+            raise FileNotFoundError(f"Labels file not found: {self.labels_path}")
+
+    def __iter__(self):
+        with open(self.features_path, newline="") as feat_fh, open(self.labels_path, newline="") as lab_fh:
+            feat_reader = csv.reader(feat_fh)
+            lab_reader = csv.reader(lab_fh)
+
+            row_idx = 0
+
+            while True:
+                feat_row = self._next_non_empty_row(feat_reader)
+                lab_row = self._next_non_empty_row(lab_reader)
+
+                if feat_row is None and lab_row is None:
+                    break
+
+                if feat_row is None or lab_row is None:
+                    raise ValueError(
+                        f"Feature/label length mismatch near row {row_idx} "
+                        f"for {self.features_path.name}"
+                    )
+
+                features = self._parse_features(feat_row, row_idx)
+                label = self._parse_label(lab_row, row_idx)
+
+                yield row_idx, features, label
+                row_idx += 1
+
     def count_rows(self) -> int:
-        """Count the number of data rows in the features CSV."""
-        n = 0
+        n_rows = 0
         with open(self.features_path, newline="") as fh:
             reader = csv.reader(fh)
             for row in reader:
                 if row:
-                    try:
-                        float(row[0])   # skip non-numeric header
-                        n += 1
-                    except ValueError:
-                        pass
-        return n
+                    n_rows += 1
+        return n_rows
+
+    @staticmethod
+    def _next_non_empty_row(reader):
+        for row in reader:
+            if row:
+                return row
+        return None
+
+    def _parse_features(self, row: list[str], row_idx: int) -> np.ndarray:
+        try:
+            features = np.asarray(row, dtype=np.float32)
+        except ValueError as exc:
+            raise ValueError(
+                f"Non-numeric feature row at index {row_idx} in {self.features_path.name}"
+            ) from exc
+
+        if self._n_features is None:
+            self._n_features = len(features)
+            if self._n_features != self.expected_n_features:
+                logger.warning(
+                    "Found %d features in %s, Expected %d.",
+                    self._n_features,
+                    self.features_path.name,
+                    self.expected_n_features,
+                )
+
+        return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _parse_label(self, row: list[str], row_idx: int) -> int:
+        raw = str(row[0]).strip()
+
+        if raw == "":
+            raise ValueError(
+                f"Empty label at row {row_idx} in {self.labels_path.name}"
+            )
+
+        try:
+            return int(float(raw) > 0.0)
+        except ValueError:
+            token = raw.lower()
+            if token in _BENIGN_TOKENS:
+                return 0
+            return 1

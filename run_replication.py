@@ -1,303 +1,365 @@
-"""
-Phase 1: Replicate Kitsune on KitNET pre-extracted feature CSV datasets.
-------------------------------------------------------------
-    python run_replication.py \
-        --dataset_dir dataset/ \
-        --n_train 400000 \
-        --m 10 \
-        --output_dir results/
-"""
+"""Replicates KitNET on pre-extracted feature CSV datasets."""
 
 from __future__ import annotations
+
 import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.feature_mapper import FeatureMapper
 from core.kitnet import KitNET
-from dataset_reader import CSVDatasetReader, EXPECTED_N_FEATURES
-from evaluation.metrics import compute_metrics, print_metrics
+from dataset_reader import (
+    EXPECTED_N_FEATURES,
+    DatasetPair,
+    PairedCSVDatasetReader,
+    discover_dataset_pairs,
+)
+from evaluation.metrics import build_curve_frames, compute_metrics, print_metrics
+from evaluation.plot_results import make_all_plots
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s %(levelname)-8s %(message)s",
     datefmt="%H:%M:%S",
 )
+
 logger = logging.getLogger(__name__)
 
 
-
-class KitNETFromCSV:
-    """
-    Kitsune pipeline for pre-extracted feature CSVs.
-
-    Parameters
-    ----------
-    n_train          : int   rows used for FM fitting + KitNET training
-    max_cluster_size : int   m — max features per autoencoder (default 10)
-    n_features       : int   feature dimensionality (default 115)
-    beta             : float hidden-layer compression ratio (default 0.75)
-    lr               : float SGD learning rate (default 0.1)
-    """
+class KitNETFromExtractedCSV:
+    """Runs FeatureMapper + KitNET over precomputed feature rows."""
 
     def __init__(
         self,
-        n_train:          int,
-        max_cluster_size: int   = 10,
-        n_features:       int   = EXPECTED_N_FEATURES,
-        beta:             float = 0.75,
-        lr:               float = 0.1,
+        fm_grace: int = 5000,
+        ad_grace: int = 50000,
+        max_cluster_size: int = 10,
+        n_features: int = EXPECTED_N_FEATURES,
+        beta: float = 0.75,
+        lr: float = 0.1,
     ):
-        self.n_train = n_train
-        self.fm      = FeatureMapper(
+        self.fm_grace = fm_grace
+        self.ad_grace = ad_grace
+        self.max_cluster_size = max_cluster_size
+        self.n_features = n_features
+        self.beta = beta
+        self.lr = lr
+
+        self.fm = FeatureMapper(
             n_features=n_features,
             max_cluster_size=max_cluster_size,
         )
+
         self.ad: KitNET | None = None
-        self.beta = beta
-        self.lr   = lr
-        self.phi: float = 0.0
+        self._fm_fitted = False
+        self._n_seen = 0
+        self.phi = 0.0
 
-        self._n_seen   = 0
-        self._in_train = True
+    @property
+    def warmup_rows(self) -> int:
+        return self.fm_grace + self.ad_grace
 
-    def process(self, features: np.ndarray) -> float | None:
-        """
-        Process one pre-extracted feature vector.
-
-        Returns
-        -------
-        float  — anomaly score (exec-mode)
-        None   — during train-mode
-        """
+    def process(self, features: np.ndarray) -> tuple[float | None, str]:
+        row_idx = self._n_seen
         self._n_seen += 1
 
-        if self._in_train:
+        if row_idx < self.fm_grace:
+            # First phase: only teach the mapper the correlation structure.
             self.fm.update(features)
+            return None, "fm_train"
 
-            if self._n_seen == self.n_train:
-                # ---- Transition from train to exec ----
-                logger.info(
-                    "Fitting FeatureMapper after %d training rows...",
-                    self.n_train,
-                )
-                self.fm.fit()
-                logger.info(
-                    "FeatureMapper fitted: k=%d clusters, sizes=%s",
-                    self.fm.n_clusters, self.fm.cluster_sizes,
-                )
-                self.ad = KitNET(
-                    cluster_sizes=self.fm.cluster_sizes,
-                    beta=self.beta,
-                    lr=self.lr,
-                )
-                self._in_train = False
-                # Train KitNET on this transition instance
-                vi    = self.fm.transform(features)
-                score = self.ad.train(vi)
-                self.phi = max(self.phi, score)
+        if not self._fm_fitted:
+            # Freeze the mapping before any autoencoder training happens.
+            logger.info("Fitting the FeatureMapper after %d rows.", self.fm_grace)
+            self.fm.fit()
+            self.ad = KitNET(
+                cluster_sizes=self.fm.cluster_sizes,
+                beta=self.beta,
+                lr=self.lr,
+            )
+            self._fm_fitted = True
+            logger.info(
+                "FeatureMapper ready: k=%d, cluster sizes=%s",
+                self.fm.n_clusters,
+                self.fm.cluster_sizes,
+            )
 
-            return None
+        sub_instances = self.fm.transform(features)
 
-        else:
-            # Exec-mode: score the instance without updating weights
-            vi    = self.fm.transform(features)
-            score = self.ad.execute(vi)
-            return score
+        if row_idx < self.warmup_rows:
+            # Warmup KitNET but do not score yet; track max phi for thresholding.
+            score = float(self.ad.train(sub_instances))
+            self.phi = max(self.phi, score)
+            return None, "ad_train"
+
+        # Steady-state scoring after both grace periods finish.
+        score = float(self.ad.execute(sub_instances))
+        return score, "exec"
+
+
+def sanitize_dataset_name(name: str) -> str:
+    return name.replace(" ", "_")
 
 
 def run_dataset(
-    dataset_name:  str,
-    features_path: Path,
-    ts_path:       Path | None,
-    n_train:       int,
-    attack_start:  int,
-    m:             int,
-    output_dir:    Path,
+    pair: DatasetPair,
+    output_dir: Path,
+    fm_grace: int,
+    ad_grace: int,
+    max_cluster_size: int,
+    beta: float,
+    lr: float,
+    expected_n_features: int,
+    log_every: int = 100_000,
 ) -> dict:
-    """Run the pipeline on one feature CSV and compute detection metrics."""
+    logger.info("=" * 70)
+    logger.info("Dataset: %s", pair.name)
+    logger.info("Features: %s", pair.features_path.name)
+    logger.info("Labels:   %s", pair.labels_path.name)
 
-    logger.info("=" * 60)
-    logger.info("Dataset      : %s", dataset_name)
-    logger.info("Features CSV : %s", features_path.name)
-    logger.info("Timestamps   : %s",
-                ts_path.name if ts_path else "synthetic (row index)")
-    logger.info(
-        "n_train: %d  |  attack_start: %d  |  m: %d",
-        n_train, attack_start, m,
+    reader = PairedCSVDatasetReader(
+        features_path=pair.features_path,
+        labels_path=pair.labels_path,
+        expected_n_features=expected_n_features,
     )
 
-    pipeline = KitNETFromCSV(n_train=n_train, max_cluster_size=m)
-    reader   = CSVDatasetReader(features_path, ts_path)
+    total_rows = reader.count_rows()
 
-    scores_list: list[float] = []
-    labels_list: list[int]   = []
-    row_idx = 0
-
-    for features, _ in reader:
-        score = pipeline.process(features)
-
-        if score is not None:
-            # Label: 1 if this row is in the attack window, else 0
-            label = 1 if row_idx >= attack_start else 0
-            scores_list.append(score)
-            labels_list.append(label)
-
-            if len(scores_list) % 50_000 == 0:
-                logger.info(
-                    "  [exec]  %d rows scored | malicious so far: %d",
-                    len(scores_list), int(np.sum(labels_list)),
-                )
-        else:
-            if row_idx % 100_000 == 0 and row_idx > 0:
-                logger.info(
-                    "  [train] row %d / %d", row_idx, n_train
-                )
-
-        row_idx += 1
-
-    logger.info(
-        "Finished: %d train rows | %d eval rows | %d labelled malicious",
-        n_train, len(scores_list), int(np.sum(labels_list)),
+    pipeline = KitNETFromExtractedCSV(
+        fm_grace=fm_grace,
+        ad_grace=ad_grace,
+        max_cluster_size=max_cluster_size,
+        n_features=expected_n_features,
+        beta=beta,
+        lr=lr,
     )
 
-    if not scores_list:
-        logger.warning("No exec-mode rows — nothing to evaluate.")
-        return {}
+    phase_counts = {"fm_train": 0, "ad_train": 0, "exec": 0}
+    score_rows: list[dict] = []
 
-    scores = np.array(scores_list, dtype=np.float64)
-    labels = np.array(labels_list, dtype=np.int32)
+    start_time = time.time()
 
-    # Compute and display metrics
-    metrics = compute_metrics(scores, labels, dataset_name=dataset_name)
+    for row_idx, features, label in reader:
+        score, phase = pipeline.process(features)
+        phase_counts[phase] += 1
+
+        if phase == "exec":
+            # Only commit rows once the system is fully warmed up.
+            score_rows.append(
+                {
+                    "row_index": row_idx,
+                    "label": int(label),
+                    "score": float(score),
+                }
+            )
+
+        if row_idx > 0 and row_idx % log_every == 0:
+            logger.info(
+                "Row %d/%d | fm=%d ad=%d exec=%d",
+                row_idx,
+                total_rows,
+                phase_counts["fm_train"],
+                phase_counts["ad_train"],
+                phase_counts["exec"],
+            )
+
+    runtime_sec = time.time() - start_time
+
+    if not score_rows:
+        logger.warning("Finished %s but there were no eval rows to score.", pair.name)
+        return {"dataset": pair.name, "error": "no_eval_rows"}
+
+    scores_df = pd.DataFrame(score_rows)
+    scores = scores_df["score"].to_numpy(dtype=np.float64)
+    labels = scores_df["label"].to_numpy(dtype=np.int32)
+
+    metrics = compute_metrics(
+        scores=scores,
+        labels=labels,
+        dataset_name=pair.name,
+        runtime_sec=runtime_sec,
+        extra={
+            "original_rows_seen": int(total_rows),
+            "FMgrace": int(fm_grace),
+            "ADgrace": int(ad_grace),
+            "warmup_rows": int(pipeline.warmup_rows),
+            "max_cluster_size": int(max_cluster_size),
+            "n_clusters": int(pipeline.fm.n_clusters),
+            "cluster_sizes": pipeline.fm.cluster_sizes,
+            "phase_fm_rows": int(phase_counts["fm_train"]),
+            "phase_ad_rows": int(phase_counts["ad_train"]),
+            "phase_exec_rows": int(phase_counts["exec"]),
+            "phi_train_max": round(float(pipeline.phi), 6),
+        },
+    )
+
     print_metrics(metrics)
 
-    # Save outputs
-    out_dir = output_dir / dataset_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / "scores.npy", scores)
-    np.save(out_dir / "labels.npy", labels)
-    with open(out_dir / "metrics.json", "w") as fh:
+    dataset_dir = output_dir / sanitize_dataset_name(pair.name)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    scores_df.to_csv(dataset_dir / "scores.csv", index=False)
+    np.save(dataset_dir / "scores.npy", scores)
+    np.save(dataset_dir / "labels.npy", labels)
+
+    roc_df, pr_df = build_curve_frames(scores=scores, labels=labels)
+    roc_df.to_csv(dataset_dir / "roc_curve.csv", index=False)
+    pr_df.to_csv(dataset_dir / "pr_curve.csv", index=False)
+
+    with open(dataset_dir / "metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2)
-    logger.info("Results saved → %s", out_dir)
+
+    logger.info("Saved dataset results to %s", dataset_dir)
     return metrics
 
 
-def _discover_pairs(
-    dataset_dir: Path,
-) -> list[tuple[str, Path, Path | None]]:
-    """
-    Scan dataset_dir for feature/timestamp CSV pairs.
+def build_dataset_list(
+    sample_dir: Path | None,
+    features_path: Path | None,
+    labels_path: Path | None,
+) -> list[DatasetPair]:
+    if sample_dir is not None:
+        pairs = discover_dataset_pairs(sample_dir)
+        if not pairs:
+            raise FileNotFoundError(f"No dataset pairs found in {sample_dir}")
+        return pairs
 
-    KitNET naming convention:
-        mirai3.csv    → feature file
-        mirai3_ts.csv → paired timestamp file
+    if features_path is None or labels_path is None:
+        raise ValueError("Both --features and --labels are required together.")
 
-    Any CSV whose stem does NOT end in '_ts' is treated as a feature file.
-    The matching timestamp file <stem>_ts.csv is used if it exists.
-    """
-    pairs = []
-    for feat_csv in sorted(dataset_dir.glob("*.csv")):
-        if feat_csv.stem.endswith("_ts"):
-            continue
-        ts_csv  = dataset_dir / (feat_csv.stem + "_ts.csv")
-        ts_path = ts_csv if ts_csv.exists() else None
-        pairs.append((feat_csv.stem, feat_csv, ts_path))
-    return pairs
+    return [
+        DatasetPair(
+            name=features_path.stem.replace("_dataset", ""),
+            features_path=features_path,
+            labels_path=labels_path,
+        )
+    ]
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Phase 1 — Kitsune replication on KitNET pre-extracted CSV datasets."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        description="Replicate KitNET on sampled Kitsune feature CSV datasets."
     )
 
-    # Input: single file pair OR directory
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument(
-        "--features", type=Path,
-        metavar="FEATURES_CSV",
-        help="Path to a features CSV  (e.g.  dataset/mirai3.csv).",
+        "--sample_dir",
+        type=Path,
+        help="Directory containing sampled *_dataset.csv and *_labels.csv files.",
     )
     src.add_argument(
-        "--dataset_dir", type=Path,
-        metavar="DIR",
-        help="Directory containing *.csv feature files (auto-discovers pairs).",
+        "--features",
+        type=Path,
+        help="Path to one sampled features CSV.",
     )
 
     parser.add_argument(
-        "--timestamps", type=Path, default=None,
-        metavar="TIMESTAMPS_CSV",
-        help="Timestamps CSV paired with --features  (e.g.  dataset/mirai3_ts.csv).",
+        "--labels",
+        type=Path,
+        default=None,
+        help="Path to one sampled labels CSV (use with --features).",
     )
     parser.add_argument(
-        "--n_train", type=int, default=400_000,
-        help="Rows used for training (default: 400,000).",
+        "--output_dir",
+        type=Path,
+        default=Path("results"),
+        help="Directory for per-dataset results.",
     )
     parser.add_argument(
-        "--attack_start", type=int, default=None,
-        help=(
-            "Row index (0-based, inclusive) where the attack begins "
-            "in exec-mode.  Defaults to n_train."
-        ),
+        "--fm_grace",
+        type=int,
+        default=5000,
+        help="Rows used to train the FeatureMapper.",
     )
     parser.add_argument(
-        "--m", type=int, default=10,
-        help="Max features per autoencoder input  (default: 10).",
+        "--ad_grace",
+        type=int,
+        default=50000,
+        help="Rows used to train KitNET after the mapper is fixed.",
     )
     parser.add_argument(
-        "--output_dir", type=Path, default=Path("results"),
-        help="Directory to write results  (default: ./results).",
+        "--m",
+        type=int,
+        default=10,
+        help="Max features per autoencoder input.",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.75,
+        help="Hidden-layer compression ratio.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.1,
+        help="Learning rate for the autoencoders.",
+    )
+    parser.add_argument(
+        "--expected_n_features",
+        type=int,
+        default=EXPECTED_N_FEATURES,
+        help="Expected feature count per row.",
+    )
+    parser.add_argument(
+        "--skip_plots",
+        action="store_true",
+        help="Skip plot generation at the end.",
     )
 
-    args   = parser.parse_args(argv)
-    attack = args.attack_start if args.attack_start is not None else args.n_train
+    args = parser.parse_args(argv)
+
+    if args.features is not None and args.labels is None:
+        parser.error("--labels is required when you use --features")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build the list of datasets to process
-    if args.features:
-        datasets: list[tuple[str, Path, Path | None]] = [(
-            args.features.stem,
-            args.features,
-            args.timestamps,
-        )]
-    else:
-        datasets = _discover_pairs(args.dataset_dir)
-        if not datasets:
-            logger.error("No feature CSV files found in %s", args.dataset_dir)
-            sys.exit(1)
-        logger.info(
-            "Discovered %d dataset(s) in %s", len(datasets), args.dataset_dir
-        )
+    dataset_pairs = build_dataset_list(
+        sample_dir=args.sample_dir,
+        features_path=args.features,
+        labels_path=args.labels,
+    )
 
-    # Run
-    all_metrics: dict = {}
-    for name, feat_csv, ts_csv in datasets:
-        m = run_dataset(
-            dataset_name=name,
-            features_path=feat_csv,
-            ts_path=ts_csv,
-            n_train=args.n_train,
-            attack_start=attack,
-            m=args.m,
+    logger.info("Found %d dataset(s) to run.", len(dataset_pairs))
+
+    all_metrics: list[dict] = []
+
+    for pair in dataset_pairs:
+        metrics = run_dataset(
+            pair=pair,
             output_dir=args.output_dir,
+            fm_grace=args.fm_grace,
+            ad_grace=args.ad_grace,
+            max_cluster_size=args.m,
+            beta=args.beta,
+            lr=args.lr,
+            expected_n_features=args.expected_n_features,
         )
-        all_metrics[name] = m
+        all_metrics.append(metrics)
 
-    # Summary
-    summary_path = args.output_dir / "summary.json"
-    with open(summary_path, "w") as fh:
+    summary_df = pd.DataFrame(all_metrics)
+    summary_csv = args.output_dir / "summary_metrics.csv"
+    summary_json = args.output_dir / "summary_metrics.json"
+
+    summary_df.to_csv(summary_csv, index=False)
+    with open(summary_json, "w") as fh:
         json.dump(all_metrics, fh, indent=2)
-    logger.info("Summary → %s", summary_path)
+
+    logger.info("Saved the summary table to %s", summary_csv)
+    logger.info("Saved the summary json to %s", summary_json)
+
+    if not args.skip_plots:
+        plots_dir = args.output_dir / "_plots"
+        make_all_plots(args.output_dir, plots_dir)
+        logger.info("Saved plots to %s", plots_dir)
 
 
 if __name__ == "__main__":
