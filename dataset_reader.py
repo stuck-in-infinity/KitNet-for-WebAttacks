@@ -7,70 +7,55 @@ from pathlib import Path
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 EXPECTED_N_FEATURES = 115
 
-_BENIGN_TOKENS = {
-    "0",
-    "0.0",
-    "benign",
-    "normal",
-    "false",
-    "no",
-    "clean",
-    "legit",
-}
+# String tokens that unambiguously indicate a benign sample
+_BENIGN_VOCAB = frozenset({
+    "0", "0.0", "benign", "normal", "false", "no", "clean", "legit",
+})
 
 
 @dataclass(frozen=True)
 class DatasetPair:
-    name: str
+    name:          str
     features_path: Path
-    labels_path: Path
+    labels_path:   Path
 
 
-def discover_dataset_pairs(sample_dir: str | Path) -> list[DatasetPair]:
-    sample_dir = Path(sample_dir)
-    if not sample_dir.exists():
-        raise FileNotFoundError(f"Directory not found: {sample_dir}")
+def discover_dataset_pairs(search_dir: str | Path) -> list[DatasetPair]:
+    # Finds all *_dataset.csv / *_labels.csv pairs in a directory.
+    search_dir = Path(search_dir)
+    if not search_dir.exists():
+        raise FileNotFoundError(f"Directory not found: {search_dir}")
 
-    pairs: list[DatasetPair] = []
-
-    for features_path in sorted(sample_dir.glob("*_dataset.csv")):
-        labels_path = features_path.with_name(
-            features_path.name.replace("_dataset.csv", "_labels.csv")
+    found: list[DatasetPair] = []
+    for feat_file in sorted(search_dir.glob("*_dataset.csv")):
+        label_file = feat_file.with_name(
+            feat_file.name.replace("_dataset.csv", "_labels.csv")
         )
-
-        if not labels_path.exists():
-            logger.warning("Skipped %s because labels were missing.", features_path.name)
+        if not label_file.exists():
+            log.warning("Skipping '%s': no matching label file.", feat_file.name)
             continue
-
-        name = features_path.stem.replace("_dataset", "")
-        pairs.append(
-            DatasetPair(
-                name=name,
-                features_path=features_path,
-                labels_path=labels_path,
-            )
-        )
-
-    return pairs
+        stem = feat_file.stem.replace("_dataset", "")
+        found.append(DatasetPair(name=stem, features_path=feat_file, labels_path=label_file))
+    return found
 
 
 class PairedCSVDatasetReader:
-    """Streams paired feature and label rows from two CSV files."""
+    # Streams paired (feature_vector, label) rows from two aligned CSV files.
 
     def __init__(
         self,
-        features_path: str | Path,
-        labels_path: str | Path,
+        features_path:       str | Path,
+        labels_path:         str | Path,
         expected_n_features: int = EXPECTED_N_FEATURES,
     ):
-        self.features_path = Path(features_path)
-        self.labels_path = Path(labels_path)
+        self.features_path       = Path(features_path)
+        self.labels_path         = Path(labels_path)
         self.expected_n_features = expected_n_features
-        self._n_features: int | None = None
+        self._detected_width:    int | None = None
 
         if not self.features_path.exists():
             raise FileNotFoundError(f"Features file not found: {self.features_path}")
@@ -78,79 +63,68 @@ class PairedCSVDatasetReader:
             raise FileNotFoundError(f"Labels file not found: {self.labels_path}")
 
     def __iter__(self):
-        with open(self.features_path, newline="") as feat_fh, open(self.labels_path, newline="") as lab_fh:
+        with (
+            open(self.features_path, newline="") as feat_fh,
+            open(self.labels_path,   newline="") as lbl_fh,
+        ):
             feat_reader = csv.reader(feat_fh)
-            lab_reader = csv.reader(lab_fh)
-
-            row_idx = 0
+            lbl_reader  = csv.reader(lbl_fh)
+            row_num     = 0
 
             while True:
-                feat_row = self._next_non_empty_row(feat_reader)
-                lab_row = self._next_non_empty_row(lab_reader)
+                feat_row = self._advance(feat_reader)
+                lbl_row  = self._advance(lbl_reader)
 
-                if feat_row is None and lab_row is None:
+                if feat_row is None and lbl_row is None:
                     break
 
-                if feat_row is None or lab_row is None:
+                if feat_row is None or lbl_row is None:
                     raise ValueError(
-                        f"Feature/label length mismatch near row {row_idx} "
-                        f"for {self.features_path.name}"
+                        f"Row count mismatch near row {row_num} in '{self.features_path.name}'."
                     )
 
-                features = self._parse_features(feat_row, row_idx)
-                label = self._parse_label(lab_row, row_idx)
-
-                yield row_idx, features, label
-                row_idx += 1
+                yield row_num, self._to_features(feat_row, row_num), self._to_label(lbl_row, row_num)
+                row_num += 1
 
     def count_rows(self) -> int:
-        n_rows = 0
+        total = 0
         with open(self.features_path, newline="") as fh:
-            reader = csv.reader(fh)
-            for row in reader:
+            for row in csv.reader(fh):
                 if row:
-                    n_rows += 1
-        return n_rows
+                    total += 1
+        return total
 
     @staticmethod
-    def _next_non_empty_row(reader):
+    def _advance(reader) -> list[str] | None:
         for row in reader:
             if row:
                 return row
         return None
 
-    def _parse_features(self, row: list[str], row_idx: int) -> np.ndarray:
+    def _to_features(self, row: list[str], row_num: int) -> np.ndarray:
         try:
-            features = np.asarray(row, dtype=np.float32)
+            vec = np.asarray(row, dtype=np.float32)
         except ValueError as exc:
             raise ValueError(
-                f"Non-numeric feature row at index {row_idx} in {self.features_path.name}"
+                f"Non-numeric value in feature row {row_num} of '{self.features_path.name}'."
             ) from exc
 
-        if self._n_features is None:
-            self._n_features = len(features)
-            if self._n_features != self.expected_n_features:
-                logger.warning(
-                    "Found %d features in %s, Expected %d.",
-                    self._n_features,
-                    self.features_path.name,
-                    self.expected_n_features,
+        if self._detected_width is None:
+            self._detected_width = len(vec)
+            if self._detected_width != self.expected_n_features:
+                log.warning(
+                    "'%s' has %d features; expected %d.",
+                    self.features_path.name, self._detected_width, self.expected_n_features,
                 )
 
-        return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _parse_label(self, row: list[str], row_idx: int) -> int:
+    def _to_label(self, row: list[str], row_num: int) -> int:
         raw = str(row[0]).strip()
-
-        if raw == "":
-            raise ValueError(
-                f"Empty label at row {row_idx} in {self.labels_path.name}"
-            )
+        if not raw:
+            raise ValueError(f"Empty label at row {row_num} in '{self.labels_path.name}'.")
 
         try:
             return int(float(raw) > 0.0)
         except ValueError:
-            token = raw.lower()
-            if token in _BENIGN_TOKENS:
-                return 0
-            return 1
+            return 0 if raw.lower() in _BENIGN_VOCAB else 1

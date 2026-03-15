@@ -1,5 +1,3 @@
-"""Replicates KitNET on pre-extracted feature CSV datasets."""
-
 from __future__ import annotations
 
 import argparse
@@ -8,11 +6,14 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_root = str(Path(__file__).resolve().parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
 from core.feature_mapper import FeatureMapper
 from core.kitnet import KitNET
@@ -26,339 +27,247 @@ from evaluation.metrics import build_curve_frames, compute_metrics, print_metric
 from evaluation.plot_results import make_all_plots
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%H:%M:%S",
+    level=logging.INFO,
 )
+_log = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
 
-
-class KitNETFromExtractedCSV:
-    """Runs FeatureMapper + KitNET over precomputed feature rows."""
+class AnomalyDetectionPipeline:
+    # Three-phase pipeline: FeatureMapper training → KitNET training → inference.
+    # No score is returned during the two warm-up phases.
 
     def __init__(
         self,
-        fm_grace: int = 5000,
-        ad_grace: int = 50000,
-        max_cluster_size: int = 10,
-        n_features: int = EXPECTED_N_FEATURES,
-        beta: float = 0.75,
-        lr: float = 0.1,
-    ):
-        self.fm_grace = fm_grace
-        self.ad_grace = ad_grace
-        self.max_cluster_size = max_cluster_size
-        self.n_features = n_features
-        self.beta = beta
-        self.lr = lr
+        fm_grace:         int,
+        ad_grace:         int,
+        max_cluster_size: int   = 10,
+        num_features:     int   = EXPECTED_N_FEATURES,
+        beta_ratio:       float = 0.75,
+        step_size:        float = 0.1,
+    ) -> None:
+        self.fm_grace  = fm_grace
+        self.ad_grace  = ad_grace
 
-        self.fm = FeatureMapper(
-            n_features=n_features,
+        self.feat_mapper = FeatureMapper(
+            n_features=num_features,
             max_cluster_size=max_cluster_size,
         )
-
-        self.ad: KitNET | None = None
-        self._fm_fitted = False
-        self._n_seen = 0
-        self.phi = 0.0
+        self.detector: Optional[KitNET] = None
+        self._mapper_ready    = False
+        self._rows_seen       = 0
+        self.peak_train_score: float = 0.0
+        self._beta = beta_ratio
+        self._lr   = step_size
 
     @property
-    def warmup_rows(self) -> int:
+    def warmup_length(self) -> int:
         return self.fm_grace + self.ad_grace
 
-    def process(self, features: np.ndarray) -> tuple[float | None, str]:
-        row_idx = self._n_seen
-        self._n_seen += 1
+    def step(self, feature_vec: np.ndarray) -> Tuple[Optional[float], str]:
+        idx = self._rows_seen
+        self._rows_seen += 1
 
-        if row_idx < self.fm_grace:
-            # Teach the mapper the correlation structure.
-            self.fm.update(features)
+        # Phase 1 — build feature correlation matrix
+        if idx < self.fm_grace:
+            self.feat_mapper.update(feature_vec)
             return None, "fm_train"
 
-        if not self._fm_fitted:
-            # Freeze the mapping before any autoencoder training happens.
-            logger.info("Fitting the FeatureMapper after %d rows.", self.fm_grace)
-            self.fm.fit()
-            self.ad = KitNET(
-                cluster_sizes=self.fm.cluster_sizes,
-                beta=self.beta,
-                lr=self.lr,
+        # Transition — fit mapper once, then initialise KitNET
+        if not self._mapper_ready:
+            _log.info("Fitting FeatureMapper on %d rows...", self.fm_grace)
+            self.feat_mapper.fit()
+            self.detector = KitNET(
+                cluster_sizes=self.feat_mapper.cluster_sizes,
+                beta=self._beta,
+                lr=self._lr,
             )
-            self._fm_fitted = True
-            logger.info(
-                "FeatureMapper ready: k=%d, cluster sizes=%s",
-                self.fm.n_clusters,
-                self.fm.cluster_sizes,
+            self._mapper_ready = True
+            _log.info(
+                "FeatureMapper ready — k=%d clusters: %s",
+                self.feat_mapper.n_clusters,
+                self.feat_mapper.cluster_sizes,
             )
 
-        sub_instances = self.fm.transform(features)
+        sub_vecs = self.feat_mapper.transform(feature_vec)
 
-        if row_idx < self.warmup_rows:
-            # Warmup KitNET but do not score yet; track max phi for thresholding.
-            score = float(self.ad.train(sub_instances))
-            self.phi = max(self.phi, score)
+        # Phase 2 — train KitNET autoencoders
+        if idx < self.warmup_length:
+            score = float(self.detector.train(sub_vecs))
+            self.peak_train_score = max(self.peak_train_score, score)
             return None, "ad_train"
 
-        # Steady-state scoring after both grace periods finish.
-        score = float(self.ad.execute(sub_instances))
-        return score, "exec"
+        # Phase 3 — inference
+        return float(self.detector.execute(sub_vecs)), "exec"
 
 
-def sanitize_dataset_name(name: str) -> str:
+def _safe_dirname(name: str) -> str:
     return name.replace(" ", "_")
 
 
-def run_dataset(
-    pair: DatasetPair,
-    output_dir: Path,
-    fm_grace: int,
-    ad_grace: int,
-    max_cluster_size: int,
-    beta: float,
-    lr: float,
-    expected_n_features: int,
-    log_every: int = 100_000,
-) -> dict:
-    logger.info("=" * 70)
-    logger.info("Dataset: %s", pair.name)
-    logger.info("Features: %s", pair.features_path.name)
-    logger.info("Labels:   %s", pair.labels_path.name)
+def evaluate_single_dataset(
+    pair:          DatasetPair,
+    output_root:   Path,
+    fm_grace:      int,
+    ad_grace:      int,
+    cluster_limit: int,
+    beta:          float,
+    learn_rate:    float,
+    n_features:    int,
+    log_every:     int = 100_000,
+) -> Dict:
+    _log.info("*" * 70)
+    _log.info("Dataset  : %s", pair.name)
+    _log.info("Features : %s", pair.features_path.name)
+    _log.info("Labels   : %s", pair.labels_path.name)
 
-    reader = PairedCSVDatasetReader(
-        features_path=pair.features_path,
-        labels_path=pair.labels_path,
-        expected_n_features=expected_n_features,
-    )
-
+    reader     = PairedCSVDatasetReader(pair.features_path, pair.labels_path, n_features)
     total_rows = reader.count_rows()
 
-    pipeline = KitNETFromExtractedCSV(
-        fm_grace=fm_grace,
-        ad_grace=ad_grace,
-        max_cluster_size=max_cluster_size,
-        n_features=expected_n_features,
-        beta=beta,
-        lr=lr,
+    pipeline = AnomalyDetectionPipeline(
+        fm_grace=fm_grace, ad_grace=ad_grace,
+        max_cluster_size=cluster_limit,
+        num_features=n_features, beta_ratio=beta, step_size=learn_rate,
     )
 
-    phase_counts = {"fm_train": 0, "ad_train": 0, "exec": 0}
-    score_rows: list[dict] = []
+    phase_counts: Dict[str, int] = {"fm_train": 0, "ad_train": 0, "exec": 0}
+    scored_rows:  List[Dict]     = []
+    t_start = time.time()
 
-    start_time = time.time()
-
-    for row_idx, features, label in reader:
-        score, phase = pipeline.process(features)
+    for idx, feat_vec, true_label in reader:
+        score, phase = pipeline.step(feat_vec)
         phase_counts[phase] += 1
 
         if phase == "exec":
-            score_rows.append(
-                {
-                    "row_index": row_idx,
-                    "label": int(label),
-                    "score": float(score),
-                }
+            scored_rows.append({"row_index": idx, "label": int(true_label), "score": float(score)})
+
+        if idx > 0 and idx % log_every == 0:
+            _log.info(
+                "Row %d / %d  |  fm=%d  ad=%d  exec=%d",
+                idx, total_rows,
+                phase_counts["fm_train"], phase_counts["ad_train"], phase_counts["exec"],
             )
 
-        if row_idx > 0 and row_idx % log_every == 0:
-            logger.info(
-                "Row %d/%d | fm=%d ad=%d exec=%d",
-                row_idx,
-                total_rows,
-                phase_counts["fm_train"],
-                phase_counts["ad_train"],
-                phase_counts["exec"],
-            )
+    elapsed = time.time() - t_start
 
-    runtime_sec = time.time() - start_time
-
-    if not score_rows:
-        logger.warning("Finished %s but there were no eval rows to score.", pair.name)
+    if not scored_rows:
+        _log.warning("No scored rows for '%s'.", pair.name)
         return {"dataset": pair.name, "error": "no_eval_rows"}
 
-    scores_df = pd.DataFrame(score_rows)
-    scores = scores_df["score"].to_numpy(dtype=np.float64)
-    labels = scores_df["label"].to_numpy(dtype=np.int32)
+    results_df = pd.DataFrame(scored_rows)
+    score_arr  = results_df["score"].to_numpy(dtype=np.float64)
+    label_arr  = results_df["label"].to_numpy(dtype=np.int32)
 
     metrics = compute_metrics(
-        scores=scores,
-        labels=labels,
-        dataset_name=pair.name,
-        runtime_sec=runtime_sec,
+        scores=score_arr, labels=label_arr,
+        dataset_name=pair.name, runtime_sec=elapsed,
         extra={
-            "original_rows_seen": int(total_rows),
-            "FMgrace": int(fm_grace),
-            "ADgrace": int(ad_grace),
-            "warmup_rows": int(pipeline.warmup_rows),
-            "max_cluster_size": int(max_cluster_size),
-            "n_clusters": int(pipeline.fm.n_clusters),
-            "cluster_sizes": pipeline.fm.cluster_sizes,
-            "phase_fm_rows": int(phase_counts["fm_train"]),
-            "phase_ad_rows": int(phase_counts["ad_train"]),
-            "phase_exec_rows": int(phase_counts["exec"]),
-            "phi_train_max": round(float(pipeline.phi), 6),
+            "total_rows":       int(total_rows),
+            "fm_grace":         int(fm_grace),
+            "ad_grace":         int(ad_grace),
+            "warmup_rows":      int(pipeline.warmup_length),
+            "max_cluster_size": int(cluster_limit),
+            "n_clusters":       int(pipeline.feat_mapper.n_clusters),
+            "cluster_sizes":    pipeline.feat_mapper.cluster_sizes,
+            "fm_train_rows":    int(phase_counts["fm_train"]),
+            "ad_train_rows":    int(phase_counts["ad_train"]),
+            "exec_rows":        int(phase_counts["exec"]),
+            "peak_train_score": round(float(pipeline.peak_train_score), 6),
         },
     )
 
     print_metrics(metrics)
 
-    dataset_dir = output_dir / sanitize_dataset_name(pair.name)
-    dataset_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = output_root / _safe_dirname(pair.name)
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-    scores_df.to_csv(dataset_dir / "scores.csv", index=False)
-    np.save(dataset_dir / "scores.npy", scores)
-    np.save(dataset_dir / "labels.npy", labels)
+    results_df.to_csv(target_dir / "scores.csv", index=False)
+    np.save(target_dir / "scores.npy", score_arr)
+    np.save(target_dir / "labels.npy", label_arr)
 
-    roc_df, pr_df = build_curve_frames(scores=scores, labels=labels)
-    roc_df.to_csv(dataset_dir / "roc_curve.csv", index=False)
-    pr_df.to_csv(dataset_dir / "pr_curve.csv", index=False)
+    roc_df, pr_df = build_curve_frames(scores=score_arr, labels=label_arr)
+    roc_df.to_csv(target_dir / "roc_curve.csv", index=False)
+    pr_df.to_csv( target_dir / "pr_curve.csv",  index=False)
 
-    with open(dataset_dir / "metrics.json", "w") as fh:
+    with open(target_dir / "metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2)
 
-    logger.info("Saved dataset results to %s", dataset_dir)
+    _log.info("Artefacts written → %s", target_dir)
     return metrics
 
 
-def build_dataset_list(
-    sample_dir: Path | None,
-    features_path: Path | None,
-    labels_path: Path | None,
-) -> list[DatasetPair]:
-    if sample_dir is not None:
-        pairs = discover_dataset_pairs(sample_dir)
+def resolve_datasets(
+    scan_dir:      Optional[Path],
+    features_file: Optional[Path],
+    labels_file:   Optional[Path],
+) -> List[DatasetPair]:
+    if scan_dir is not None:
+        pairs = discover_dataset_pairs(scan_dir)
         if not pairs:
-            raise FileNotFoundError(f"No dataset pairs found in {sample_dir}")
+            raise FileNotFoundError(f"No dataset pairs found in '{scan_dir}'.")
         return pairs
 
-    if features_path is None or labels_path is None:
-        raise ValueError("Both --features and --labels are required together.")
+    if not features_file or not labels_file:
+        raise ValueError("Provide both --features and --labels when not using --sample_dir.")
 
-    return [
-        DatasetPair(
-            name=features_path.stem.replace("_dataset", ""),
-            features_path=features_path,
-            labels_path=labels_path,
-        )
-    ]
+    stem = features_file.stem
+    if stem.endswith("_dataset"):
+        stem = stem[:-8]
+    return [DatasetPair(name=stem, features_path=features_file, labels_path=labels_file)]
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Replicate KitNET on sampled Kitsune feature CSV datasets."
+        description="Run KitNET anomaly detection on pre-extracted CSV datasets."
     )
 
     src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument(
-        "--sample_dir",
-        type=Path,
-        help="Directory containing sampled *_dataset.csv and *_labels.csv files.",
-    )
-    src.add_argument(
-        "--features",
-        type=Path,
-        help="Path to one sampled features CSV.",
-    )
+    src.add_argument("--sample_dir", type=Path,
+                     help="Directory with *_dataset.csv / *_labels.csv pairs.")
+    src.add_argument("--features",   type=Path, help="Path to a features CSV.")
 
-    parser.add_argument(
-        "--labels",
-        type=Path,
-        default=None,
-        help="Path to one sampled labels CSV (use with --features).",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=Path,
-        default=Path("results"),
-        help="Directory for per-dataset results.",
-    )
-    parser.add_argument(
-        "--fm_grace",
-        type=int,
-        default=5000,
-        help="Rows used to train the FeatureMapper.",
-    )
-    parser.add_argument(
-        "--ad_grace",
-        type=int,
-        default=50000,
-        help="Rows used to train KitNET after the mapper is fixed.",
-    )
-    parser.add_argument(
-        "--m",
-        type=int,
-        default=10,
-        help="Max features per autoencoder input.",
-    )
-    parser.add_argument(
-        "--beta",
-        type=float,
-        default=0.75,
-        help="Hidden-layer compression ratio.",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.1,
-        help="Learning rate for the autoencoders.",
-    )
-    parser.add_argument(
-        "--expected_n_features",
-        type=int,
-        default=EXPECTED_N_FEATURES,
-        help="Expected feature count per row.",
-    )
-    parser.add_argument(
-        "--skip_plots",
-        action="store_true",
-        help="Skip plot generation at the end.",
-    )
+    parser.add_argument("--labels",      type=Path,  default=None)
+    parser.add_argument("--output_dir",  type=Path,  default=Path("results"))
+    parser.add_argument("--fm_grace",    type=int,   default=5_000)
+    parser.add_argument("--ad_grace",    type=int,   default=50_000)
+    parser.add_argument("--m",           type=int,   default=10)
+    parser.add_argument("--beta",        type=float, default=0.75)
+    parser.add_argument("--lr",          type=float, default=0.1)
+    parser.add_argument("--expected_n_features", type=int, default=EXPECTED_N_FEATURES)
+    parser.add_argument("--skip_plots",  action="store_true")
 
     args = parser.parse_args(argv)
 
     if args.features is not None and args.labels is None:
-        parser.error("--labels is required when you use --features")
+        parser.error("--labels is required when --features is provided.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_pairs = build_dataset_list(
-        sample_dir=args.sample_dir,
-        features_path=args.features,
-        labels_path=args.labels,
-    )
+    dataset_list = resolve_datasets(args.sample_dir, args.features, args.labels)
+    _log.info("Datasets to process: %d", len(dataset_list))
 
-    logger.info("Found %d dataset(s) to run.", len(dataset_pairs))
-
-    all_metrics: list[dict] = []
-
-    for pair in dataset_pairs:
-        metrics = run_dataset(
-            pair=pair,
-            output_dir=args.output_dir,
-            fm_grace=args.fm_grace,
-            ad_grace=args.ad_grace,
-            max_cluster_size=args.m,
-            beta=args.beta,
-            lr=args.lr,
-            expected_n_features=args.expected_n_features,
+    all_metrics: List[Dict] = []
+    for ds in dataset_list:
+        result = evaluate_single_dataset(
+            pair=ds, output_root=args.output_dir,
+            fm_grace=args.fm_grace, ad_grace=args.ad_grace,
+            cluster_limit=args.m, beta=args.beta,
+            learn_rate=args.lr, n_features=args.expected_n_features,
         )
-        all_metrics.append(metrics)
+        all_metrics.append(result)
 
     summary_df = pd.DataFrame(all_metrics)
-    summary_csv = args.output_dir / "summary_metrics.csv"
-    summary_json = args.output_dir / "summary_metrics.json"
-
-    summary_df.to_csv(summary_csv, index=False)
-    with open(summary_json, "w") as fh:
+    summary_df.to_csv(args.output_dir / "summary_metrics.csv", index=False)
+    with open(args.output_dir / "summary_metrics.json", "w") as fh:
         json.dump(all_metrics, fh, indent=2)
 
-    logger.info("Saved the summary table to %s", summary_csv)
-    logger.info("Saved the summary json to %s", summary_json)
+    _log.info("Summary → %s", args.output_dir / "summary_metrics.json")
 
     if not args.skip_plots:
         plots_dir = args.output_dir / "_plots"
         make_all_plots(args.output_dir, plots_dir)
-        logger.info("Saved plots to %s", plots_dir)
+        _log.info("Plots → %s", plots_dir)
 
 
 if __name__ == "__main__":
