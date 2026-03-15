@@ -23,8 +23,7 @@ kitsune_impl/
 ├── dataset_reader.py              # Streams paired feature + label CSV rows
 │                                  # Discovers *_dataset.csv / *_labels.csv pairs automatically
 ├── run_replication.py             # Main replication script for pre-extracted feature CSVs
-├── check.py                       # Quick sanity check on saved scores and labels
-└── checkmetric.py                 # Quick print of a saved metrics.json
+├── results                        # All output metrics and plots are saved in this directory
 ```
 
 ---
