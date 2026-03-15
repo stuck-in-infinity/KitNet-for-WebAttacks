@@ -1,43 +1,5 @@
 """
-phase1/run_replication.py
---------------------------
 Phase 1: Replicate Kitsune on KitNET pre-extracted feature CSV datasets.
-
-This script works with the exact file format from the KitNET GitHub repo:
-    https://github.com/ymirsky/KitNET-py
-
-Expected files (in the dataset/ directory or passed directly):
-    mirai3.csv       — 115 pre-extracted features per row, no header
-    mirai3_ts.csv    — Unix timestamp per row, no header
-
-Because features are already extracted by the KitNET repo, the
-FeatureExtractor (FE) component is bypassed completely.  Feature vectors
-are fed directly into FeatureMapper → KitNET.
-
-Label strategy
---------------
-The KitNET repo does not ship label files.  Labels are derived as:
-    row index  < n_train              → training phase (no label assigned)
-    n_train ≤ row index < attack_start → exec-mode benign  (label = 0)
-    row index ≥ attack_start           → exec-mode malicious (label = 1)
-
-For Mirai, the paper states training uses the first ~52 minutes of traffic.
-Set --attack_start to the row index where the Mirai infection begins.
-If omitted, attack_start defaults to n_train (all exec-mode rows treated as
-attacks — valid when the dataset contains only benign traffic in the training
-window and attack traffic immediately after, which is the KitNET convention).
-
-Usage — single file pair (your current setup)
----------------------------------------------
-    python run_replication.py \
-        --features   dataset/mirai3.csv \
-        --timestamps dataset/mirai3_ts.csv \
-        --n_train    400000 \
-        --attack_start 400000 \
-        --m          10 \
-        --output_dir results/
-
-Usage — auto-scan directory for all *.csv / *_ts.csv pairs
 ------------------------------------------------------------
     python run_replication.py \
         --dataset_dir dataset/ \
@@ -70,14 +32,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ======================================================================= #
-#  Pipeline: FeatureMapper + KitNET on pre-extracted feature vectors
-# ======================================================================= #
 
 class KitNETFromCSV:
     """
     Kitsune pipeline for pre-extracted feature CSVs.
-    Skips the FeatureExtractor since features are already computed.
 
     Parameters
     ----------
@@ -153,10 +111,6 @@ class KitNETFromCSV:
             score = self.ad.execute(vi)
             return score
 
-
-# ======================================================================= #
-#  Single dataset evaluation
-# ======================================================================= #
 
 def run_dataset(
     dataset_name:  str,
@@ -235,10 +189,6 @@ def run_dataset(
     return metrics
 
 
-# ======================================================================= #
-#  Auto-discover paired CSVs in a directory
-# ======================================================================= #
-
 def _discover_pairs(
     dataset_dir: Path,
 ) -> list[tuple[str, Path, Path | None]]:
@@ -261,10 +211,6 @@ def _discover_pairs(
         pairs.append((feat_csv.stem, feat_csv, ts_path))
     return pairs
 
-
-# ======================================================================= #
-#  CLI
-# ======================================================================= #
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
