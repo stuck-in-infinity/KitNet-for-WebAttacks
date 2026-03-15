@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class Kitsune:
-    """Online NIDS with train and exec phases."""
+    """ NIDS with train and exec phases."""
 
     def __init__(
         self,
@@ -46,7 +46,6 @@ class Kitsune:
             self.fm.update(x)
 
             if self._n_seen == self.n_train:
-                # Flip into exec mode once we've seen the planned training budget.
                 self._switch_to_exec()
 
             if self.ad is not None:
@@ -82,7 +81,7 @@ class Kitsune:
             self.fm.n_clusters,
             self.fm.cluster_sizes,
         )
-        # Initialise the anomaly detector with the frozen mapping.
+        # Initialise the anomaly detector
         self.ad = KitNET(
             cluster_sizes=self.fm.cluster_sizes,
             beta=self.beta,

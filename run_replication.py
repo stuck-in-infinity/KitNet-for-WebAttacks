@@ -72,7 +72,7 @@ class KitNETFromExtractedCSV:
         self._n_seen += 1
 
         if row_idx < self.fm_grace:
-            # First phase: only teach the mapper the correlation structure.
+            # Teach the mapper the correlation structure.
             self.fm.update(features)
             return None, "fm_train"
 
@@ -152,7 +152,6 @@ def run_dataset(
         phase_counts[phase] += 1
 
         if phase == "exec":
-            # Only commit rows once the system is fully warmed up.
             score_rows.append(
                 {
                     "row_index": row_idx,
