@@ -1,6 +1,4 @@
 # Kitsune Implementation
-## SIL765 — Networks & System Security, Semester 2 2025–26
-**Susmit Mahato (2025MCS2102) | Mahima Gupta (2024CSZ8492)**
 
 ---
 
@@ -16,14 +14,10 @@ kitsune_impl/
 │   ├── kitnet.py                  # KitNET: ensemble autoencoder anomaly detector
 │   └── kitsune.py                 # Full Kitsune pipeline (FE + FM + AD)
 │
-├── phase1/                        # Network-layer replication
-│   ├── pcap_parser.py             # PCAP file parser (no external dependencies)
-│   └── run_replication.py         # Evaluation script for KitNET PCAP datasets
+├──── dataset_reader.py          # read the dataset (no external dependencies)
+│  
+│──── run_replication.py         # Evaluation script for KitNET PCAP datasets
 │
-├── phase2/                        # Web-layer extension
-│   ├── web_feature_extractor.py   # HTTP-layer FE: 50 features per request
-│   ├── cicids_parser.py           # CSE-CIC-IDS2018 CSV parser + train/test split
-│   └── run_web_extension.py       # Evaluation script for web attack detection
 │
 ├── evaluation/
 │   ├── metrics.py                 # TPR, FNR, AUC, EER, F1 computation
