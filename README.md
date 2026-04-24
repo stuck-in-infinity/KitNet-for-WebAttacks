@@ -51,9 +51,7 @@ KitNet-for-WebAttacks/
 │   ├── http_pipeline.py           Phase 3 pipeline with HTTP-tuned warmup
 │   └── run_phase3_http.py         Standalone Kaggle-ready runner
 │
-├── results/                       Phase 1 results
-├── results_phase2/                Phase 2 results
-└── phase3results/                 Phase 3 results
+├── results/                       Phase 1 results(Rest of results are stored in google drive access to which is provided in report)
 ```
 
 ---
